@@ -1,13 +1,19 @@
-// Breadth-velocity bot: buy coins whose distinct-buyer count climbs fast while the curve is young,
-// then bank a take-profit, cut a stop or time out so the slot recycles.
+// Breadth-velocity bot: a coin qualifies once its distinct buyers pile up fast while the curve is
+// young, so the crowd is wide rather than one wallet; each entry exits on take-profit, stop or time.
 import { LAMPORTS_PER_SOL, runBot, type BuyInput, type SellInput } from './vendor/makefun-bot.ts';
 
 const STAKE = LAMPORTS_PER_SOL / 20n;
 const MIN_CAP = LAMPORTS_PER_SOL / 100n;
-const TAKE_PROFIT = 1.5;
-const STOP_LOSS = 0.75;
-const MAX_HOLD_SLOTS = 80;
+const TAKE_PROFIT = 1.4;
+const STOP_LOSS = 0.8;
+const MAX_HOLD_SLOTS = 100;
 const SLIP_BPS = 2_000;
+
+const TIERS: ReadonlyArray<readonly [number, number, bigint]> = [
+  [20, 10, LAMPORTS_PER_SOL],
+  [40, 30, LAMPORTS_PER_SOL],
+  [80, 60, 5n * LAMPORTS_PER_SOL],
+];
 
 interface Track { entry: number; slot: number }
 
@@ -20,20 +26,18 @@ function mid(quote: bigint, tokens: bigint): number {
   return Number(quote) / Number(tokens);
 }
 
+function qualifies(breadth: number, age: number, reserve: bigint): boolean {
+  return TIERS.some(([need, maxAge, minReserve]) => breadth >= need && age <= maxAge && reserve >= minReserve);
+}
+
 await runBot({
   onHello() {},
   onBatch(state, batch) {
     const orders: Array<BuyInput | SellInput> = [];
-
     for (const e of batch.events) {
-      if (e.event === 'CreateEvent') {
-        candidates.add(e.mint);
-        buyers.set(e.mint, new Set());
-      } else if (e.event === 'TradeEvent' && e.is_buy) {
-        buyers.get(e.mint)?.add(e.user);
-      }
+      if (e.event === 'CreateEvent') { candidates.add(e.mint); buyers.set(e.mint, new Set()); }
+      else if (e.event === 'TradeEvent' && e.is_buy) buyers.get(e.mint)?.add(e.user);
     }
-
     for (const f of batch.fills) {
       if (f.side === 'buy' && f.status === 'filled') {
         const c = state.curves.get(f.mint);
@@ -41,7 +45,6 @@ await runBot({
       }
       if (f.side === 'sell') selling.delete(f.mint);
     }
-
     for (const [mint, holding] of state.positions) {
       if (selling.has(mint)) continue;
       const c = state.curves.get(mint);
@@ -53,7 +56,6 @@ await runBot({
       selling.add(mint);
       if (orders.length >= state.hello.caps.max_orders_per_batch) break;
     }
-
     const tx = state.txFeeLamports();
     let free = state.freeCashLamports();
     let slots = state.hello.caps.max_open_positions - state.committedPositionCount();
@@ -62,8 +64,7 @@ await runBot({
       const c = state.curves.get(e.mint);
       if (c === undefined || c.complete || c.created_slot === null) continue;
       const breadth = buyers.get(e.mint)?.size ?? 0;
-      const age = state.slot - c.created_slot;
-      if (breadth < 20 || age > 10 || c.real_quote_reserves < LAMPORTS_PER_SOL) continue;
+      if (!qualifies(breadth, state.slot - c.created_slot, c.real_quote_reserves)) continue;
       candidates.delete(e.mint);
       if (state.positions.has(e.mint)) continue;
       const cap = state.maxBuyLamports(e.mint);
@@ -75,7 +76,6 @@ await runBot({
       free -= amount + tx;
       slots -= 1;
     }
-
     return orders;
   },
 });
